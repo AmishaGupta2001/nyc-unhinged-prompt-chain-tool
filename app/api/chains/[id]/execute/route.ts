@@ -1,30 +1,58 @@
-
 import { NextResponse } from "next/server";
 import { requireApiSuperadmin } from "@/lib/auth";
 
-type Ctx = { params: Promise<{ id: string }> };
+type Ctx = {
+    params: Promise<{ id: string }>;
+};
 
 type GeminiError = Error & {
     status?: number;
 };
 
+type InputImage = {
+    data: string;
+    mimeType: string;
+};
+
 const GEMINI_URL =
     "https://generativelanguage.googleapis.com/v1beta/models/";
+
+const ALLOWED_IMAGE_TYPES = [
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+];
 
 async function gemini(
     model: string,
     key: string,
     prompt: string,
-    image = false
+    inputImage?: InputImage,
+    generateImage = false
 ) {
+    const parts: Record<string, unknown>[] = [];
+
+    if (inputImage) {
+        parts.push({
+            inlineData: {
+                mimeType: inputImage.mimeType,
+                data: inputImage.data,
+            },
+        });
+    }
+
+    parts.push({ text: prompt });
+
     const response = await fetch(
         `${GEMINI_URL}${model}:generateContent?key=${key}`,
         {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+                "Content-Type": "application/json",
+            },
             body: JSON.stringify({
-                contents: [{ parts: [{ text: prompt }] }],
-                generationConfig: image
+                contents: [{ parts }],
+                generationConfig: generateImage
                     ? { responseModalities: ["TEXT", "IMAGE"] }
                     : { temperature: 0.7 },
             }),
@@ -52,7 +80,7 @@ async function gemini(
     try {
         json = JSON.parse(responseBody);
     } catch {
-        // Preserve the raw response for error diagnostics.
+        // Keep the raw response for error diagnostics.
     }
 
     if (!response.ok) {
@@ -66,7 +94,8 @@ async function gemini(
             status: response.status,
             statusText: response.statusText,
             message: providerMessage,
-            imageRequest: image,
+            imageInput: Boolean(inputImage),
+            imageGeneration: generateImage,
         });
 
         const error: GeminiError = new Error(providerMessage);
@@ -74,14 +103,16 @@ async function gemini(
         throw error;
     }
 
-    const parts = json.candidates?.[0]?.content?.parts || [];
+    const responseParts =
+        json.candidates?.[0]?.content?.parts || [];
 
-    const text = parts
+    const text = responseParts
         .filter((part) => part.text)
         .map((part) => part.text!)
-        .join("\n");
+        .join("\n")
+        .trim();
 
-    const imagePart = parts.find(
+    const imagePart = responseParts.find(
         (part) => part.inlineData?.data
     );
 
@@ -96,7 +127,24 @@ async function gemini(
     };
 }
 
-export async function POST(request: Request, { params }: Ctx) {
+function renderTemplate(
+    template: string,
+    values: {
+        input: string;
+        previousOutput: string;
+        chainName: string;
+    }
+) {
+    return template
+        .replaceAll("{{input}}", values.input)
+        .replaceAll("{{previous_output}}", values.previousOutput)
+        .replaceAll("{{chain_name}}", values.chainName);
+}
+
+export async function POST(
+    request: Request,
+    { params }: Ctx
+) {
     const auth = await requireApiSuperadmin();
 
     if (auth.response) return auth.response;
@@ -107,16 +155,62 @@ export async function POST(request: Request, { params }: Ctx) {
 
     if (!key) {
         return NextResponse.json(
-            { error: "GEMINI_API_KEY is not configured on the server." },
+            {
+                error: "GEMINI_API_KEY is not configured on the server.",
+            },
             { status: 500 }
         );
     }
 
-    let input: string;
+    let input = "";
+    let inputImage: InputImage | undefined;
 
     try {
         const body = await request.json();
-        input = String(body.input ?? "");
+
+        input = String(body.input ?? "").trim();
+
+        if (body.image != null) {
+            const image = body.image;
+
+            if (
+                typeof image !== "object" ||
+                typeof image.data !== "string" ||
+                typeof image.mimeType !== "string"
+            ) {
+                return NextResponse.json(
+                    { error: "Invalid image data." },
+                    { status: 400 }
+                );
+            }
+
+            if (!ALLOWED_IMAGE_TYPES.includes(image.mimeType)) {
+                return NextResponse.json(
+                    {
+                        error: "Only JPG, PNG and WebP images are supported.",
+                    },
+                    { status: 400 }
+                );
+            }
+
+            if (
+                !image.data ||
+                image.data.length > 14_000_000 ||
+                !/^[A-Za-z0-9+/]+={0,2}$/.test(image.data)
+            ) {
+                return NextResponse.json(
+                    {
+                        error: "Invalid image data or image is too large. Maximum upload size is 10 MB.",
+                    },
+                    { status: 400 }
+                );
+            }
+
+            inputImage = {
+                data: image.data,
+                mimeType: image.mimeType,
+            };
+        }
     } catch {
         return NextResponse.json(
             { error: "Invalid request body." },
@@ -124,15 +218,27 @@ export async function POST(request: Request, { params }: Ctx) {
         );
     }
 
-    const { data: chain, error: chainError } = await auth.supabase
-        .from("prompt_chains")
-        .select("*")
-        .eq("id", id)
-        .single();
+    if (!input && !inputImage) {
+        return NextResponse.json(
+            {
+                error: "Enter some text or upload an image before running the chain.",
+            },
+            { status: 400 }
+        );
+    }
+
+    const { data: chain, error: chainError } =
+        await auth.supabase
+            .from("prompt_chains")
+            .select("*")
+            .eq("id", id)
+            .single();
 
     if (chainError || !chain) {
         return NextResponse.json(
-            { error: chainError?.message || "Chain not found." },
+            {
+                error: chainError?.message || "Chain not found.",
+            },
             { status: 404 }
         );
     }
@@ -174,120 +280,93 @@ export async function POST(request: Request, { params }: Ctx) {
         process.env.GEMINI_IMAGE_MODEL ||
         "gemini-2.0-flash-preview-image-generation";
 
-    // Build all stages into ONE text-generation request.
-    const stages = steps.map((step, index) => {
-        const template = String(step.prompt_template)
-            .replaceAll("{{input}}", input)
-            .replaceAll("{{chain_name}}", String(chain.name))
-            .replaceAll(
-                "{{previous_output}}",
-                index === 0
-                    ? input
-                    : `[Use the complete output of stage ${index} as context.]`
-            );
+    const outputs: {
+        step: string;
+        output: string;
+    }[] = [];
 
-        return `STAGE ${index + 1}: ${step.name}\n${template}`;
-    });
-
-    const combinedPrompt = `
-You are executing a multi-stage AI prompt chain.
-
-Chain name: ${chain.name}
-
-Original user input:
-${input}
-
-Execute the following stages IN ORDER.
-
-For each stage:
-1. Follow its instructions.
-2. Use the original input and the output of the preceding stage.
-3. Preserve all useful information from previous stages.
-4. Pass your complete result to the next stage.
-
-${stages.join("\n\n")}
-
-Return ONLY valid JSON in this exact structure:
-{
-  "outputs": [
-    {
-      "step": "stage name",
-      "output": "complete stage output"
-    }
-  ],
-  "final_output": "complete final stage output"
-}
-
-Include one output for every stage, in the original order.
-Do not omit stages.
-`;
+    let previousOutput = input || "Analyze the attached image.";
 
     try {
-        // ONE text request for all stages.
-        const textResult = await gemini(
-            textModel,
-            key,
-            combinedPrompt
-        );
+        // Execute each enabled step separately and in order.
+        for (let index = 0; index < steps.length; index++) {
+            const step = steps[index];
 
-        let parsed: {
-            outputs: { step: string; output: string }[];
-            final_output: string;
-        };
-
-        try {
-            const cleaned = textResult.text
-                .replace(/^```(?:json)?\s*/i, "")
-                .replace(/\s*```$/, "");
-
-            parsed = JSON.parse(cleaned);
-        } catch {
-            console.error(
-                "[Chain Execution Error] Gemini returned invalid JSON."
-            );
-
-            return NextResponse.json(
+            const template = renderTemplate(
+                String(step.prompt_template),
                 {
-                    error:
-                        "Gemini returned an invalid chain response. No automatic retry was made.",
-                },
-                { status: 502 }
+                    input: input || "See the attached image.",
+                    previousOutput,
+                    chainName: String(chain.name),
+                }
             );
+
+            const prompt = `
+You are executing step ${index + 1} of a sequential prompt chain.
+
+Chain: ${chain.name}
+Step: ${step.name}
+
+Original user input:
+${input || "(The user supplied an image instead of text.)"}
+
+${index === 0
+                ? "Use the attached image as the primary input for this step, if an image was supplied."
+                : `The actual output from the previous step is:\n${previousOutput}`}
+
+Instructions for this step:
+${template}
+
+Complete this step only.
+Do not attempt to execute future steps.
+Return the complete result as plain text.
+`;
+
+            console.log("[Chain Execution] Running step", {
+                chainId: id,
+                stepNumber: index + 1,
+                stepName: step.name,
+                hasImageInput: index === 0 && Boolean(inputImage),
+            });
+
+            const result = await gemini(
+                textModel,
+                key,
+                prompt,
+                index === 0 ? inputImage : undefined
+            );
+
+            if (!result.text) {
+                throw new Error(
+                    `Gemini returned an empty result for step ${index + 1}: ${step.name}`
+                );
+            }
+
+            previousOutput = result.text;
+
+            outputs.push({
+                step: step.name,
+                output: result.text,
+            });
         }
 
-        if (
-            !Array.isArray(parsed.outputs) ||
-            parsed.outputs.length !== steps.length ||
-            !parsed.final_output
-        ) {
-            console.error(
-                "[Chain Execution Error] Gemini returned incomplete chain results."
-            );
+        const finalPrompt = previousOutput;
 
-            return NextResponse.json(
-                {
-                    error:
-                        "Gemini returned incomplete chain results. No automatic retry was made.",
-                },
-                { status: 502 }
-            );
-        }
-
-        const outputs = parsed.outputs;
-        const finalPrompt = parsed.final_output;
-
-        // ONE image request after successful text generation.
+        // Generate final media using the final step's actual output.
         const imagePrompt = `
-Create a polished visual based on this creative brief.
-Return an image.
+Create a polished, visually compelling image based on the following creative brief.
 
+Creative brief:
 ${finalPrompt}
+
+Create the image itself. Do not simply describe it in text.
 `;
 
         const imageResult = await gemini(
             imageModel,
             key,
             imagePrompt,
+            undefined,
             true
         );
 
@@ -295,7 +374,7 @@ ${finalPrompt}
             return NextResponse.json(
                 {
                     error:
-                        "Text generation succeeded, but image generation returned no image.",
+                        "All text steps completed, but Gemini did not return a generated image.",
                     outputs,
                     finalPrompt,
                 },
@@ -314,6 +393,8 @@ ${finalPrompt}
         console.error("[Chain Execution Error]", {
             status: error.status,
             message: error.message,
+            completedSteps: outputs.length,
+            totalSteps: steps.length,
         });
 
         if (error.status === 429) {
@@ -322,6 +403,7 @@ ${finalPrompt}
                     error:
                         "Gemini quota exceeded. No retry was attempted. Wait for your quota to reset.",
                     code: "QUOTA_EXCEEDED",
+                    outputs,
                 },
                 { status: 429 }
             );
@@ -333,6 +415,7 @@ ${finalPrompt}
                     error:
                         "Gemini is temporarily unavailable or overloaded. No retry was attempted.",
                     code: "GEMINI_UNAVAILABLE",
+                    outputs,
                 },
                 { status: error.status }
             );
@@ -343,6 +426,7 @@ ${finalPrompt}
                 error:
                     error.message ||
                     "Chain execution failed. No automatic retry was attempted.",
+                outputs,
             },
             { status: error.status || 502 }
         );
